@@ -1,3 +1,20 @@
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+
+*.zip
+*.pkl
+*.joblib
+.DS_Store
+__pycache__/
+.ipynb_checkpoints/
+Ctrl + O
+Entrée
+Ctrl + X
+Ctrl + O
+Entrée
+Ctrl + X
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
