@@ -3,6 +3,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from core.data import load_player_features, parse_hand_replay
+from core.hand_classifier import classify_made_hand, describe_preflop, detect_draws
 from core.model import build_hand_summary, compute_all_probabilities
 from core.table_renderer import render_poker_table
 from core.ui import callout, page_header, section_label
@@ -14,16 +15,30 @@ _POS_COLOR  = {
     "SB": "#4A6FA5", "BB": "#4A6FA5",
     "UTG": "#4A5568", "HJ": "#4A5568", "CO": "#4A5568", "BTN": "#6B5B95",
 }
-_ACTION_FR  = {"fold": "Se couche", "call": "Appel / Check", "raise": "Relance"}
 _ACTION_COL = {"fold": "#C94040", "call": "#4CAF82", "raise": "#D4A017"}
-_SUIT_SYM    = {"h": "♥", "d": "♦", "s": "♠", "c": "♣"}
-_SUIT_COL    = {"h": "#E03535", "d": "#E03535", "s": "#D1D9E6", "c": "#D1D9E6"}
-_RANK_DISP   = {"T": "10"}   # T = Ten in PHH notation
-_STREET_FR  = {
-    "preflop": "PRÉFLOP", "flop": "FLOP",
-    "turn": "TURN",       "river": "RIVER", "showdown": "FIN",
+_SUIT_SYM   = {"h": "♥", "d": "♦", "s": "♠", "c": "♣"}
+_SUIT_COL   = {"h": "#E03535", "d": "#E03535", "s": "#D1D9E6", "c": "#D1D9E6"}
+_RANK_DISP  = {"T": "10"}
+_STREET_LABEL = {
+    "preflop": "PREFLOP", "flop": "FLOP",
+    "turn": "TURN", "river": "RIVER", "showdown": "SHOWDOWN",
 }
 _PLR_COLORS = ["#5B8DD9", "#4CAF82", "#C94040", "#7B68EE", "#F97316", "#94AECF"]
+
+
+# ─── Equity cache (module-level for st.cache_data compatibility) ───────────────
+
+@st.cache_data(show_spinner="Calcul des équités poker...")
+def _compute_equity_cached(hc_key: tuple, board_key: tuple) -> dict:
+    """
+    Compute and cache hand equity.
+    hc_key   : tuple of (player_idx, tuple-of-card-tuples)
+    board_key: tuple of card tuples
+    """
+    from core.equity import compute_equity
+    hc = {p: [list(c) for c in cards] for p, cards in hc_key}
+    bc = [list(c) for c in board_key]
+    return compute_equity(hc, bc)
 
 
 # ─── Pure helpers ─────────────────────────────────────────────────────────────
@@ -44,12 +59,15 @@ def _card_text(rank: str, suit: str) -> str:
     return f'<span style="color:{col};font-weight:700">{disp}{sym}</span>'
 
 
+def _fmtc(v: float) -> str:
+    return f"{int(v):,}".replace(",", " ")
+
+
 def _build_replay_steps(replay: dict, idx_to_name: dict) -> list[dict]:
     """Build the ordered list of discrete events for action-by-action replay."""
     actions_by_street = replay.get("actions_by_street", {})
     board_by_street   = replay.get("board_by_street", {})
 
-    # Pot / stack tracking — initialised from PHH header fields
     blinds_raw = replay.get("blinds", [])
     antes_raw  = replay.get("antes", [])
     stacks_raw = replay.get("starting_stacks", [])
@@ -64,9 +82,19 @@ def _build_replay_steps(replay: dict, idx_to_name: dict) -> list[dict]:
     invested_round = {i + 1: _g(blinds_raw, i) for i in range(n)}
     facing_bet     = max(blinds_raw) if blinds_raw else 0
     pot            = sum(blinds_raw) + sum(antes_raw)
+    last_raise_to  = max(blinds_raw) if blinds_raw else 0
 
     state = {"board": [], "folded": set()}
     steps = []
+
+    def _snap_state() -> dict:
+        return {
+            "pot":           pot,
+            "facing_bet":    facing_bet,
+            "last_raise_to": last_raise_to,
+            "player_stacks": dict(player_stacks),
+            "big_blind":     big_blind,
+        }
 
     def snap(type_, street, label, *, active=None, atype=None, amount=None,
              pos=None, new_cards=None, context=None):
@@ -82,15 +110,8 @@ def _build_replay_steps(replay: dict, idx_to_name: dict) -> list[dict]:
             "position":    pos,
             "new_cards":   new_cards or [],
             "context":     context,
+            "state_after": _snap_state(),
         }
-
-    def fmt_action(act) -> str:
-        pos  = act.get("position", "")
-        name = idx_to_name.get(act["player_idx"], f"p{act['player_idx']}")
-        verb = _ACTION_FR.get(act["action_type"], act["action_type"])
-        if act["action_type"] == "raise" and act.get("amount"):
-            verb = f"Relance {act['amount']:,}".replace(",", " ")
-        return f"[{pos}] {name} — {verb}"
 
     def _get_context(p_idx, atype, amount):
         inv = invested_round.get(p_idx, 0)
@@ -105,17 +126,36 @@ def _build_replay_steps(replay: dict, idx_to_name: dict) -> list[dict]:
             "chips_added":  chips_added,
             "stack_before": player_stacks.get(p_idx, 0),
             "big_blind":    big_blind,
+            "facing_bet":   facing_bet,
         }
 
+    def _fmt_action_rich(act, ctx) -> str:
+        pos    = act.get("position", "")
+        name   = idx_to_name.get(act["player_idx"], f"p{act['player_idx']}")
+        atype  = act["action_type"]
+        chips  = ctx.get("chips_added", 0)
+        amount = act.get("amount")
+        facing = ctx.get("facing_bet", 0)
+        if atype == "raise" and amount is not None:
+            verb = f"{'Raise' if facing > 0 else 'Bet'} to {_fmtc(amount)}"
+        elif atype == "call" and chips > 0:
+            verb = f"Call {_fmtc(chips)}"
+        elif atype == "call":
+            verb = "Check"
+        else:
+            verb = "Fold"
+        return f"[{pos}] {name} — {verb}"
+
     def _apply_action(p_idx, atype, amount):
-        nonlocal pot, facing_bet
+        nonlocal pot, facing_bet, last_raise_to
         inv = invested_round.get(p_idx, 0)
         if atype == "raise" and amount is not None:
             chips = max(0, amount - inv)
             pot += chips
             player_stacks[p_idx] = player_stacks.get(p_idx, 0) - chips
             invested_round[p_idx] = amount
-            facing_bet = amount
+            facing_bet    = amount
+            last_raise_to = amount
         elif atype == "call":
             chips = max(0, facing_bet - inv)
             pot += chips
@@ -123,8 +163,9 @@ def _build_replay_steps(replay: dict, idx_to_name: dict) -> list[dict]:
             invested_round[p_idx] = facing_bet
 
     def _reset_round():
-        nonlocal facing_bet
-        facing_bet = 0
+        nonlocal facing_bet, last_raise_to
+        facing_bet    = 0
+        last_raise_to = 0
         for k in list(invested_round.keys()):
             invested_round[k] = 0
 
@@ -133,16 +174,17 @@ def _build_replay_steps(replay: dict, idx_to_name: dict) -> list[dict]:
             p_idx  = act["player_idx"]
             atype  = act["action_type"]
             amount = act.get("amount")
-            ctx = _get_context(p_idx, atype, amount)
+            ctx   = _get_context(p_idx, atype, amount)
+            label = _fmt_action_rich(act, ctx)
             if atype == "fold":
                 state["folded"] = state["folded"] | {p_idx}
             _apply_action(p_idx, atype, amount)
-            steps.append(snap("action", street_name, fmt_action(act),
+            steps.append(snap("action", street_name, label,
                                active=p_idx, atype=atype,
                                amount=amount, pos=act.get("position"),
                                context=ctx))
 
-    def process_street(street_name, fr_prefix):
+    def process_street(street_name):
         cards = board_by_street.get(street_name, [])
         if not cards:
             return
@@ -150,17 +192,17 @@ def _build_replay_steps(replay: dict, idx_to_name: dict) -> list[dict]:
         state["board"] = state["board"] + cards
         card_str = " ".join(f"{_RANK_DISP.get(r, r)}{_SUIT_SYM.get(s, s)}" for r, s in cards)
         steps.append(snap("board_reveal", street_name,
-                          f"▶ {fr_prefix} : {card_str}", new_cards=cards))
+                          f"▶ {street_name.upper()}: {card_str}", new_cards=cards))
         _process_actions(street_name)
 
-    steps.append(snap("start", "preflop", "Début de main — distribution des cartes"))
+    steps.append(snap("start", "preflop", "Deal — hole cards"))
     _process_actions("preflop")
 
-    process_street("flop",  "FLOP")
-    process_street("turn",  "TURN")
-    process_street("river", "RIVER")
+    process_street("flop")
+    process_street("turn")
+    process_street("river")
 
-    steps.append(snap("showdown", "showdown", "Fin de main — résultat"))
+    steps.append(snap("showdown", "showdown", "Showdown — result"))
     return steps
 
 
@@ -225,17 +267,62 @@ correct_label = "✓ Correcte" if correct else "✗ Incorrecte"
 idx_to_name   = dict(zip(hand_df["player_position_index"], hand_df["player_name"]))
 initial_probs = dict(zip(hand_df["player_position_index"], hand_df["win_probability"]))
 
-replay       = parse_hand_replay(source_path)
-replay_steps = _build_replay_steps(replay, idx_to_name) if replay else []
+replay        = parse_hand_replay(source_path)
+replay_steps  = _build_replay_steps(replay, idx_to_name) if replay else []
+big_blind     = replay.get("big_blind") or 100 if replay else 100
 
-# Precompute normalized probs at every step
+# ML probabilities: preflop LR score, renormalized at each step as players fold
 step_probs = [_normalize(initial_probs, step["folded"]) for step in replay_steps]
 
-# Street jump points: step index of first board_reveal per street
+# Street jump points
 street_jumps: dict[str, int] = {}
 for _i, _s in enumerate(replay_steps):
     if _s["type"] == "board_reveal" and _s["street"] not in street_jumps:
         street_jumps[_s["street"]] = _i
+
+# ─── Poker equity (actual hand strength, computed per street) ──────────────────
+#
+# This is different from the ML model output.
+# Equity = probability that a hand wins given the visible cards + remaining deck.
+# Changes only when new community cards are revealed.
+
+_raw_hc = replay.get("hole_cards", {}) if replay else {}
+_boards = replay.get("board_by_street", {}) if replay else {}
+_fbs    = replay.get("folded_by_street", {}) if replay else {}
+
+_b_flop  = _boards.get("flop", [])
+_b_turn  = _b_flop + _boards.get("turn", [])
+_b_river = _b_turn + _boards.get("river", [])
+
+
+def _hc_key(folded: set) -> tuple:
+    return tuple(sorted(
+        (p, tuple(tuple(c) for c in cards))
+        for p, cards in _raw_hc.items()
+        if p not in folded
+    ))
+
+
+def _bk(board: list) -> tuple:
+    return tuple(tuple(c) for c in board)
+
+
+if _raw_hc:
+    eq_preflop = _compute_equity_cached(_hc_key(set()),                      _bk([]))
+    eq_flop    = _compute_equity_cached(_hc_key(_fbs.get("preflop", set())), _bk(_b_flop))
+    eq_turn    = _compute_equity_cached(_hc_key(_fbs.get("flop",    set())), _bk(_b_turn))
+    eq_river   = _compute_equity_cached(_hc_key(_fbs.get("turn",    set())), _bk(_b_river))
+else:
+    eq_preflop = eq_flop = eq_turn = eq_river = {}
+
+_eq_map = {
+    "preflop":  eq_preflop,
+    "flop":     eq_flop,
+    "turn":     eq_turn,
+    "river":    eq_river,
+    "showdown": eq_river,
+}
+equity_at_step = [_eq_map.get(s["street"], eq_preflop) for s in replay_steps]
 
 # ─── Session state ────────────────────────────────────────────────────────────
 
@@ -247,16 +334,28 @@ total     = len(replay_steps)
 step_idx  = min(max(st.session_state[step_key], 0), max(total - 1, 0))
 cur_step  = replay_steps[step_idx] if total else {}
 cur_probs = step_probs[step_idx]   if total else _normalize(initial_probs, frozenset())
+cur_equity = equity_at_step[step_idx] if total else {}
+
+# ─── Current hand state (post-action snapshot) ────────────────────────────────
+
+_sa           = cur_step.get("state_after", {})
+panel_pot     = _sa.get("pot", 0)
+panel_facing  = _sa.get("facing_bet", 0)
+panel_raise   = _sa.get("last_raise_to", 0)
+panel_stacks  = _sa.get("player_stacks", {})
+panel_bb      = _sa.get("big_blind") or big_blind
+panel_active  = sum(1 for p in hand_df["player_position_index"]
+                    if p not in cur_step.get("folded", frozenset()))
 
 # ─── Page header ──────────────────────────────────────────────────────────────
 
 page_header("Table de jeu", f"Replay · {_short_label(composite_id)}")
 
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Joueurs",       str(n_players))
-c2.metric("Favori prédit", fav_name)
-c3.metric("Probabilité",   f"{fav_prob:.1%}")
-c4.metric("Prédiction",    correct_label)
+c1.metric("Joueurs",          str(n_players))
+c2.metric("Favori ML",        fav_name)
+c3.metric("Score ML",         f"{fav_prob:.1%}")
+c4.metric("Prédiction ML",    correct_label)
 
 st.divider()
 
@@ -264,7 +363,6 @@ st.divider()
 
 section_label("Replay pas à pas")
 
-# Prev / Banner / Next
 c_prev, c_banner, c_next = st.columns([1, 8, 1])
 
 with c_prev:
@@ -282,7 +380,7 @@ with c_next:
 with c_banner:
     _atype  = cur_step.get("action_type") or ""
     _acolor = _ACTION_COL.get(_atype, "#94AECF")
-    _st_fr  = _STREET_FR.get(cur_step.get("street", ""), "")
+    _st_fr  = _STREET_LABEL.get(cur_step.get("street", ""), "")
     _lbl    = cur_step.get("label", "")
     _num    = f"{step_idx + 1} / {total}" if total else "—"
     st.markdown(
@@ -296,7 +394,7 @@ with c_banner:
 
 # Jump buttons
 st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
-jump_def: dict[str, int] = {"⏮ Début": 0}
+jump_def: dict[str, int] = {"⏮ Start": 0}
 if "flop"  in street_jumps: jump_def["Flop"]  = street_jumps["flop"]
 if "turn"  in street_jumps: jump_def["Turn"]  = street_jumps["turn"]
 if "river" in street_jumps: jump_def["River"] = street_jumps["river"]
@@ -309,38 +407,55 @@ for _ji, (_jlbl, _jtgt) in enumerate(jump_def.items()):
             st.session_state[step_key] = _jtgt
             st.rerun()
 
-# ─── Betting context bar ──────────────────────────────────────────────────────
+# ─── Persistent hand-state panel ──────────────────────────────────────────────
 
-_ctx = cur_step.get("context")
-if _ctx and _ctx.get("chips_added", 0) > 0:
-    _pot     = _ctx["pot"]
-    _chip    = _ctx["chips_added"]
-    _stk_rem = _ctx["stack_before"] - _chip
-    _bb      = _ctx["big_blind"] or 100
+_pot_disp   = f"{_fmtc(panel_pot)} chips ({panel_pot / panel_bb:.1f} BB)"
+_call_disp  = f"{_fmtc(panel_facing)} ({panel_facing / panel_bb:.1f} BB)" if panel_facing > 0 else "—"
+_raise_disp = f"{_fmtc(panel_raise)} ({panel_raise / panel_bb:.1f} BB)"  if panel_raise  > 0 else "—"
+_call_col   = "#D4A017" if panel_facing > 0 else "#3A4A5E"
+_raise_col  = "#E08030" if panel_raise  > 0 else "#3A4A5E"
+_street_lbl = _STREET_LABEL.get(cur_step.get("street", ""), "—")
 
-    def _fmt(v):
-        return f"{int(v):,}".replace(",", " ")
+st.markdown(
+    f'<div style="background:#0C1520;border:1px solid rgba(255,255,255,0.08);'
+    f'border-radius:10px;padding:11px 20px;margin:8px 0 10px;'
+    f'display:grid;grid-template-columns:repeat(5,1fr);gap:0">'
 
-    _pot_bb  = _pot / _bb
-    _chip_bb = _chip / _bb
-    _pct_pot = _chip / _pot * 100 if _pot > 0 else 0
+    f'<div style="border-right:1px solid rgba(255,255,255,0.07);padding-right:16px;margin-right:16px">'
+    f'<div style="font-size:7.5px;color:#4A5568;font-weight:800;letter-spacing:0.11em;'
+    f'text-transform:uppercase;margin-bottom:4px">Pot</div>'
+    f'<div style="font-size:13px;font-weight:700;color:#D1D9E6;white-space:nowrap">{_pot_disp}</div>'
+    f'</div>'
 
-    st.markdown(
-        f'<div style="background:#0C1520;border:1px solid rgba(255,255,255,0.07);'
-        f'border-radius:8px;padding:8px 18px;margin:6px 0 10px;'
-        f'font-size:11.5px;color:#6B7E96;display:flex;gap:24px;flex-wrap:wrap">'
-        f'<span>Pot&nbsp;<strong style="color:#D1D9E6">{_fmt(_pot)}&nbsp;chips'
-        f'&nbsp;({_pot_bb:.1f}&nbsp;BB)</strong></span>'
-        f'<span>Mise/Appel&nbsp;<strong style="color:#D4A017">{_fmt(_chip)}&nbsp;chips'
-        f'&nbsp;({_chip_bb:.1f}&nbsp;BB&nbsp;·&nbsp;{_pct_pot:.0f}%&nbsp;du&nbsp;pot)'
-        f'</strong></span>'
-        f'<span>Stack&nbsp;restant&nbsp;<strong style="color:#4CAF82">'
-        f'{_fmt(_stk_rem)}</strong></span>'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
+    f'<div style="border-right:1px solid rgba(255,255,255,0.07);padding-right:16px;margin-right:16px">'
+    f'<div style="font-size:7.5px;color:#4A5568;font-weight:800;letter-spacing:0.11em;'
+    f'text-transform:uppercase;margin-bottom:4px">Mise actuelle</div>'
+    f'<div style="font-size:13px;font-weight:700;color:{_call_col};white-space:nowrap">{_call_disp}</div>'
+    f'</div>'
 
-# ─── Poker table ──────────────────────────────────────────────────────────────
+    f'<div style="border-right:1px solid rgba(255,255,255,0.07);padding-right:16px;margin-right:16px">'
+    f'<div style="font-size:7.5px;color:#4A5568;font-weight:800;letter-spacing:0.11em;'
+    f'text-transform:uppercase;margin-bottom:4px">Dernière relance</div>'
+    f'<div style="font-size:13px;font-weight:700;color:{_raise_col};white-space:nowrap">{_raise_disp}</div>'
+    f'</div>'
+
+    f'<div style="border-right:1px solid rgba(255,255,255,0.07);padding-right:16px;margin-right:16px">'
+    f'<div style="font-size:7.5px;color:#4A5568;font-weight:800;letter-spacing:0.11em;'
+    f'text-transform:uppercase;margin-bottom:4px">Joueurs actifs</div>'
+    f'<div style="font-size:13px;font-weight:700;color:#94AECF">{panel_active}</div>'
+    f'</div>'
+
+    f'<div>'
+    f'<div style="font-size:7.5px;color:#4A5568;font-weight:800;letter-spacing:0.11em;'
+    f'text-transform:uppercase;margin-bottom:4px">Street</div>'
+    f'<div style="font-size:13px;font-weight:700;color:#6B7E96">{_street_lbl}</div>'
+    f'</div>'
+
+    f'</div>',
+    unsafe_allow_html=True,
+)
+
+# ─── Poker table (seat bars show equity, not ML score) ───────────────────────
 
 board_now   = cur_step.get("board_cards", [])
 folded_now  = cur_step.get("folded", frozenset())
@@ -348,9 +463,9 @@ active_now  = cur_step.get("active")
 is_showdown = cur_step.get("type") == "showdown"
 act_type    = cur_step.get("action_type", "")
 
-# Dynamic favorite: highest-prob active player at this step
-_active_probs = {k: v for k, v in cur_probs.items() if k not in folded_now and v > 0}
-dyn_fav_idx   = max(_active_probs, key=_active_probs.get) if _active_probs else None
+# Dynamic favorite and winner based on equity at current street
+_active_eq  = {k: v for k, v in cur_equity.items() if k not in folded_now and v > 0}
+dyn_fav_idx = max(_active_eq, key=_active_eq.get) if _active_eq else None
 
 players_render = []
 for _, _row in hand_df.iterrows():
@@ -358,18 +473,18 @@ for _, _row in hand_df.iterrows():
     name   = str(_row["player_name"])
     is_win = bool(_row["player_won"] == 1)
 
+    live_stack = panel_stacks.get(p_idx, int(_row["starting_stack"]))
+
     last_act, last_act_type = "", ""
     if p_idx == active_now and act_type:
-        last_act = _ACTION_FR.get(act_type, act_type)
-        if act_type == "raise" and cur_step.get("amount"):
-            last_act = f"Relance {cur_step['amount']:,}".replace(",", " ")
+        last_act      = cur_step.get("label", "").split(" — ", 1)[-1]
         last_act_type = act_type
 
     players_render.append({
         "name":             name,
-        "stack":            _row["starting_stack"],
+        "stack":            live_stack,
         "hole_cards":       str(_row.get("hole_cards") or ""),
-        "probability":      cur_probs.get(p_idx, 0.0),
+        "probability":      cur_equity.get(p_idx, 0.0),   # equity in the seat bar
         "is_winner":        is_win and is_showdown,
         "is_favorite":      (p_idx == dyn_fav_idx) and not is_showdown,
         "folded":           p_idx in folded_now,
@@ -385,6 +500,73 @@ table_html = render_poker_table(
     board_cards=board_now if board_now else None,
 )
 components.html(table_html, height=590, scrolling=False)
+st.caption(
+    "Seat bars (%) = true poker equity (Monte Carlo preflop / exact turn-river). "
+    "Green border = equity leader at the current street."
+)
+
+# ─── Hand analysis expander ───────────────────────────────────────────────────
+
+with st.expander("Hand analysis", expanded=False):
+    _board_list = list(board_now)
+    _th_style = (
+        "font-size:9px;font-weight:800;letter-spacing:0.1em;text-transform:uppercase;"
+        "color:#4A5568;padding:4px 10px 4px 0;border-bottom:1px solid rgba(255,255,255,0.07);"
+        "white-space:nowrap"
+    )
+    _td_style = "font-size:11px;color:#D1D9E6;padding:4px 10px 4px 0;vertical-align:top"
+    _an_html = (
+        '<table style="width:100%;border-collapse:collapse">'
+        f'<tr><th style="{_th_style}">Player</th>'
+        f'<th style="{_th_style}">Pos</th>'
+        f'<th style="{_th_style}">Hole cards</th>'
+        f'<th style="{_th_style}">Preflop type</th>'
+        f'<th style="{_th_style}">Best hand</th>'
+        f'<th style="{_th_style}">Draws / texture</th></tr>'
+    )
+
+    for _, _arow in hand_df.iterrows():
+        _ap = int(_arow["player_position_index"])
+        _is_fold = _ap in folded_now
+        _op = "0.35" if _is_fold else "1.0"
+        _apos = _POS_LABEL.get(_ap, f"p{_ap}")
+        _aname = str(_arow["player_name"])
+        _ahc = _raw_hc.get(_ap, [])
+
+        if _ahc:
+            _hc_html = " ".join(_card_text(r, s) for r, s in _ahc)
+            _pre = describe_preflop(_ahc)
+            _made = classify_made_hand(_ahc, _board_list) if _board_list else "—"
+            _draws = detect_draws(_ahc, _board_list) if _board_list else []
+            _draws_str = ", ".join(_draws) if _draws else "—"
+        else:
+            _hc_html = '<span style="color:#3A4A5E">unknown</span>'
+            _pre = _made = _draws_str = "—"
+
+        _made_col = "#D1D9E6"
+        if _made and _made not in ("—", ""):
+            if any(k in _made for k in ("Straight flush", "Quads", "Full house", "Flush", "Straight")):
+                _made_col = "#F4B942"
+            elif any(k in _made for k in ("Set", "Trips", "Two pair")):
+                _made_col = "#4CAF82"
+
+        _draws_col = "#5B8DD9" if _draws_str != "—" else "#3A4A5E"
+
+        _an_html += (
+            f'<tr style="opacity:{_op}">'
+            f'<td style="{_td_style};font-weight:600;color:#94AECF">{_aname}</td>'
+            f'<td style="{_td_style}">{_apos}</td>'
+            f'<td style="{_td_style}">{_hc_html}</td>'
+            f'<td style="{_td_style};color:#94AECF">{_pre}</td>'
+            f'<td style="{_td_style};color:{_made_col}">{_made}</td>'
+            f'<td style="{_td_style};color:{_draws_col}">{_draws_str}</td>'
+            f'</tr>'
+        )
+
+    _an_html += "</table>"
+    if not _board_list:
+        st.caption("Board cards will appear here once the flop is dealt.")
+    st.markdown(_an_html, unsafe_allow_html=True)
 
 st.divider()
 
@@ -392,10 +574,8 @@ st.divider()
 
 col_chart, col_log = st.columns([6, 4])
 
-# ── Probability evolution chart ────────────────────────────────────────────────
-
 with col_chart:
-    section_label("Évolution des probabilités")
+    section_label("Prédiction ML vs Équité poker")
 
     fig = go.Figure()
 
@@ -404,14 +584,28 @@ with col_chart:
         name   = str(_row["player_name"])
         is_win = bool(_row["player_won"] == 1)
         color  = "#F4B942" if is_win else _PLR_COLORS[p_idx % len(_PLR_COLORS)]
-        y_vals = [sp.get(p_idx, 0.0) * 100 for sp in step_probs]
 
+        # ML prediction (solid) — renormalized preflop LR score
+        y_ml = [sp.get(p_idx, 0.0) * 100 for sp in step_probs]
         fig.add_trace(go.Scatter(
-            x=list(range(len(y_vals))),
-            y=y_vals,
+            x=list(range(len(y_ml))),
+            y=y_ml,
             mode="lines",
             name=name,
-            line=dict(color=color, width=3 if is_win else 1.5, shape="hv"),
+            line=dict(color=color, width=2.5 if is_win else 1.5, shape="hv"),
+            hovertemplate=f"{name} ML: %{{y:.1f}}%<extra></extra>",
+        ))
+
+        # Equity (dashed) — true hand equity, steps only at street changes
+        y_eq = [eq.get(p_idx, 0.0) * 100 for eq in equity_at_step]
+        fig.add_trace(go.Scatter(
+            x=list(range(len(y_eq))),
+            y=y_eq,
+            mode="lines",
+            showlegend=False,
+            line=dict(color=color, width=1.5, shape="hv", dash="dot"),
+            opacity=0.50,
+            hovertemplate=f"{name} equity: %{{y:.1f}}%<extra></extra>",
         ))
 
     if total > 0:
@@ -440,23 +634,21 @@ with col_chart:
     )
     st.plotly_chart(fig, use_container_width=True)
     st.caption(
-        "Probabilités normalisées (somme = 100 %). Évoluent uniquement "
-        "par effet des retraits — pas de réévaluation sur les cartes communes."
+        "Solid = ML prediction (preflop LR score, renormalized on folds). "
+        "Dotted = true poker equity (updates only on new street). "
+        "These two curves measure different things."
     )
-
-# ── Action log ─────────────────────────────────────────────────────────────────
 
 with col_log:
     section_label("Journal de la main")
 
-    log_html = '<div style="font-size:11px;line-height:1.65;max-height:320px;overflow-y:auto">'
+    log_html = '<div style="font-size:11px;line-height:1.65;max-height:340px;overflow-y:auto">'
 
-    # Always show PRÉFLOP header first
     if replay_steps:
         log_html += (
             '<div style="margin-bottom:5px">'
             '<span style="font-size:8.5px;font-weight:800;letter-spacing:0.12em;'
-            'color:#4A5568;text-transform:uppercase">PRÉFLOP</span>'
+            'color:#4A5568;text-transform:uppercase">PREFLOP</span>'
             '</div>'
         )
 
@@ -469,7 +661,7 @@ with col_log:
 
         if _stype == "board_reveal":
             _cards_html = " ".join(_card_text(r, s) for r, s in _step.get("new_cards", []))
-            _st_fr_lbl  = _STREET_FR.get(_street, _street.upper())
+            _st_fr_lbl  = _street.upper()
             log_html += (
                 f'<div style="margin-top:12px;margin-bottom:5px;display:flex;'
                 f'align-items:baseline;gap:6px;flex-wrap:wrap">'
@@ -478,6 +670,16 @@ with col_log:
                 f'<span style="font-size:13px">{_cards_html}</span>'
                 f'</div>'
             )
+            _sa_br  = _step.get("state_after", {})
+            _pot_br = _sa_br.get("pot", 0)
+            _bb_br  = _sa_br.get("big_blind") or big_blind
+            if _pot_br > 0:
+                log_html += (
+                    f'<div style="font-size:9px;color:#3A4A5E;margin-bottom:4px;'
+                    f'padding-left:2px">Pot:&nbsp;'
+                    f'<strong style="color:#4A5A6E">{_fmtc(_pot_br)}'
+                    f'&nbsp;({_pot_br / _bb_br:.1f}&nbsp;BB)</strong></div>'
+                )
             continue
 
         if _stype == "showdown":
@@ -495,18 +697,27 @@ with col_log:
 
         _p_idx  = _step.get("active")
         _pos    = _step.get("position", "")
-        _name   = idx_to_name.get(_p_idx, f"p{_p_idx}") if _p_idx is not None else ""
         _atype  = _step.get("action_type", "")
+        _ctx    = _step.get("context") or {}
+        _chips  = _ctx.get("chips_added", 0)
         _amount = _step.get("amount")
-        _verb   = _ACTION_FR.get(_atype, _atype)
-        if _atype == "raise" and _amount:
-            _verb = f"Relance {_amount:,}".replace(",", " ")
+        _name   = idx_to_name.get(_p_idx, f"p{_p_idx}") if _p_idx is not None else ""
 
-        _acolor  = _ACTION_COL.get(_atype, "#6B7280")
-        _pc      = _POS_COLOR.get(_pos, "#4A5568")
-        _is_cur  = (_li == step_idx)
-        _bg      = "background:rgba(220,225,255,0.09);border-radius:3px;" if _is_cur else ""
-        _fw      = "font-weight:700;" if _is_cur else ""
+        _facing = _ctx.get("facing_bet", 0)
+        if _atype == "raise" and _amount is not None:
+            _verb = f"{'Raise' if _facing > 0 else 'Bet'} to {_fmtc(_amount)}"
+        elif _atype == "call" and _chips > 0:
+            _verb = f"Call {_fmtc(_chips)}"
+        elif _atype == "call":
+            _verb = "Check"
+        else:
+            _verb = "Fold"
+
+        _acolor = _ACTION_COL.get(_atype, "#6B7280")
+        _pc     = _POS_COLOR.get(_pos, "#4A5568")
+        _is_cur = (_li == step_idx)
+        _bg     = "background:rgba(220,225,255,0.09);border-radius:3px;" if _is_cur else ""
+        _fw     = "font-weight:700;" if _is_cur else ""
 
         log_html += (
             f'<div style="display:flex;align-items:center;gap:6px;'
@@ -528,10 +739,18 @@ with col_log:
 st.divider()
 section_label("Note méthodologique")
 callout(
-    "<strong>Modèle :</strong> Régression Logistique préflop avec "
-    "<code>class_weight='balanced'</code>. "
-    "Les probabilités évoluent au fil du replay uniquement par l'effet des retraits : "
-    "quand un joueur se couche, sa probabilité passe à 0 et les autres sont renormalisées. "
-    "Il ne s'agit pas d'une réévaluation basée sur les cartes communes — "
-    "le modèle n'a pas de composante post-préflop."
+    "<strong>Two distinct probability layers:</strong><br>"
+    "<strong>ML prediction (solid lines)</strong> — Logistic Regression preflop score "
+    "(<code>class_weight='balanced'</code>), trained on starting features. "
+    "Updates only by renormalization when a player folds. Does not see community cards.<br>"
+    "<strong>Poker equity (dashed lines / seat bars)</strong> — true probability that a hand wins "
+    "against the other visible hands, computed over the remaining deck. "
+    "Exact enumeration at turn/river; Monte Carlo (1,200 samples, fixed seed) at preflop/flop. "
+    "Updates only when a new street is dealt.<br>"
+    "<em>These two metrics measure different things. "
+    "ML reflects learned statistical patterns; equity reflects actual card strength.</em><br><br>"
+    "<strong>Dataset scope:</strong> the Pluribus dataset (10,000 hands) is an AI research benchmark, "
+    "<em>not</em> tournament data. Every hand resets to 10,000 chip stacks with fixed 50/100 blinds — "
+    "there is no elimination, no blind escalation, no session continuity. "
+    "The ML model predicts <em>who wins a given hand</em>, not a tournament winner."
 )
