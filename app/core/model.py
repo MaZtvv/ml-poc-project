@@ -39,19 +39,35 @@ PREFLOP_FEATURES = [
     "variant",
 ]
 
-FULL_HAND_FEATURES = PREFLOP_FEATURES + [
-    "hand_action_count",
-    "num_folds",
-    "num_check_calls",
-    "num_bets_raises",
-    "num_hole_deals",
-    "num_board_deals",
-    "num_show_or_muck",
-    "player_num_folds",
-    "player_num_check_calls",
-    "player_num_bets_raises",
-    "player_num_show_or_muck",
+# ── Leakage features (direct tautology or showdown-only) ─────────────────────
+# player_num_folds is the primary leakage vector: fold → player_won = 0, always.
+# Removing it from any predictive model is mandatory.
+LEAKAGE_FEATURES = [
+    "player_num_folds",        # fold → cannot win (near-deterministic tautology)
+    "player_num_show_or_muck", # only known at showdown
+    "num_folds",               # table-level fold count also encodes the outcome
+    "num_show_or_muck",        # showdown-only
 ]
+
+# ── Clean in-hand feature set — no direct leakage ─────────────────────────────
+# Adds action-style features that are accumulated step-by-step during replay.
+# Residual limitation: player_num_check_calls / player_num_bets_raises still
+# summarise the whole hand. Their correlation with winning is real but not
+# tautological — they encode action style, not the fold decision itself.
+INHAND_FEATURES = PREFLOP_FEATURES + [
+    "player_num_check_calls",  # player action style (not fold-driven)
+    "player_num_bets_raises",  # player aggression
+    "num_board_deals",         # streets reached (0-3); changes during replay
+    "hand_action_count",       # hand length proxy
+    "num_check_calls",         # table-level passivity
+    "num_bets_raises",         # table-level aggression
+]
+
+# ── Diagnostic full-hand feature set (kept for methodological comparison only) ─
+FULL_HAND_FEATURES = PREFLOP_FEATURES + [
+    "hand_action_count", "num_check_calls", "num_bets_raises",
+    "num_hole_deals", "num_board_deals",
+] + LEAKAGE_FEATURES
 
 
 # ─── Pipeline builder ─────────────────────────────────────────────────────────
@@ -177,6 +193,21 @@ def get_preflop_lr_pipeline():
     return pipe
 
 
+@st.cache_resource(show_spinner="Chargement du modèle in-hand...")
+def get_inhand_lr_pipeline():
+    """Logistic Regression trained on INHAND_FEATURES (no player_num_folds)."""
+    from core.data import load_player_features
+
+    df = load_player_features()
+    df_clean = df.dropna(subset=INHAND_FEATURES + [TARGET])
+    pipe = _build_pipeline(
+        INHAND_FEATURES,
+        LogisticRegression(max_iter=1000, random_state=42, class_weight="balanced"),
+    )
+    pipe.fit(df_clean[INHAND_FEATURES], df_clean[TARGET])
+    return pipe
+
+
 @st.cache_data(show_spinner="Calcul des probabilités...")
 def compute_all_probabilities(df: pd.DataFrame) -> pd.Series:
     pipe = get_preflop_lr_pipeline()
@@ -210,6 +241,184 @@ def build_hand_summary(df: pd.DataFrame) -> pd.DataFrame:
             "correct":      favorite == winner,
         })
     return pd.DataFrame(rows).sort_values("composite_id").reset_index(drop=True)
+
+
+# ─── ML analysis artifacts (analysis page) ──────────────────────────────────
+
+@st.cache_data(show_spinner="Calcul des analyses ML préflop...")
+def compute_preflop_analysis(df: pd.DataFrame) -> dict:
+    """All sklearn curve artifacts for the analysis page (preflop LR, 80/20 split)."""
+    from sklearn.calibration import calibration_curve
+    from sklearn.metrics import confusion_matrix, precision_recall_curve, roc_curve
+
+    y = df[TARGET]
+    X = df[PREFLOP_FEATURES]
+    idx = np.arange(len(y))
+    tr_idx, te_idx = train_test_split(idx, test_size=0.2, random_state=42, stratify=y)
+    X_tr, X_te = X.iloc[tr_idx], X.iloc[te_idx]
+    y_tr, y_te = y.iloc[tr_idx], y.iloc[te_idx]
+
+    pipe = _build_pipeline(
+        PREFLOP_FEATURES,
+        LogisticRegression(max_iter=1000, random_state=42, class_weight="balanced"),
+    )
+    pipe.fit(X_tr, y_tr)
+
+    y_proba = pipe.predict_proba(X_te)[:, 1]
+    y_pred  = pipe.predict(X_te)
+
+    fpr, tpr, _        = roc_curve(y_te, y_proba)
+    prec, rec, _       = precision_recall_curve(y_te, y_proba)
+    cal_frac, cal_mean = calibration_curve(y_te, y_proba, n_bins=10, strategy="quantile")
+    cm                 = confusion_matrix(y_te, y_pred)
+
+    feat_names = pipe.named_steps["preprocessor"].get_feature_names_out()
+    coefs      = pipe.named_steps["model"].coef_[0]
+    coef_df    = pd.DataFrame({"feature": feat_names, "coef": coefs})
+    coef_df["feature"] = (
+        coef_df["feature"]
+        .str.replace(r"^num__", "", regex=True)
+        .str.replace(r"^cat__variant_", "variant=", regex=True)
+    )
+    # Drop features that are constant in Pluribus (zero-variance after scaling → meaningless coef)
+    _constant = {"number_of_players", "starting_stack", "variant=NT"}
+    coef_df = coef_df[~coef_df["feature"].isin(_constant)].copy()
+    coef_df = coef_df.reindex(
+        coef_df["coef"].abs().sort_values(ascending=False).index
+    ).reset_index(drop=True)
+
+    return {
+        "y_test":   y_te.values,
+        "y_proba":  y_proba,
+        "y_pred":   y_pred,
+        "fpr":      fpr,
+        "tpr":      tpr,
+        "prec":     prec,
+        "rec":      rec,
+        "cal_frac": cal_frac,
+        "cal_mean": cal_mean,
+        "cm":       cm,
+        "coef_df":  coef_df,
+        "metrics": {
+            "accuracy":  accuracy_score(y_te, y_pred),
+            "precision": precision_score(y_te, y_pred, zero_division=0),
+            "recall":    recall_score(y_te, y_pred, zero_division=0),
+            "f1":        f1_score(y_te, y_pred, zero_division=0),
+            "roc_auc":   roc_auc_score(y_te, y_proba),
+        },
+        "pos_rate": float(y_te.mean()),
+        "n_test":   len(y_te),
+        "n_train":  len(y_tr),
+    }
+
+
+@st.cache_data(show_spinner="Entraînement du modèle in-hand (propre)...")
+def compute_inhand_analysis(df: pd.DataFrame) -> dict:
+    """
+    Train and evaluate the clean in-hand model (INHAND_FEATURES — no player_num_folds).
+
+    Returns metrics table, RF feature importance, and LR coefficients for the
+    model comparison page.  Uses the same 80/20 stratified split as the preflop
+    analysis so AUC numbers are directly comparable.
+    """
+    df_clean = df.dropna(subset=INHAND_FEATURES + [TARGET]).copy()
+    y = df_clean[TARGET]
+    X = df_clean[INHAND_FEATURES]
+    idx = np.arange(len(y))
+    tr_idx, te_idx = train_test_split(idx, test_size=0.2, random_state=42, stratify=y)
+    X_tr, X_te = X.iloc[tr_idx], X.iloc[te_idx]
+    y_tr, y_te = y.iloc[tr_idx], y.iloc[te_idx]
+
+    rows = []
+    for name, model_proto in _model_definitions().items():
+        params = model_proto.get_params()
+        pipe = _build_pipeline(INHAND_FEATURES, model_proto.__class__(**params))
+        pipe.fit(X_tr, y_tr)
+        rows.append(_evaluate_pipeline(name, pipe, X_tr, X_te, y_tr, y_te))
+
+    metrics_df = (
+        pd.DataFrame(rows)
+        .sort_values("roc_auc", ascending=False)
+        .reset_index(drop=True)
+    )
+
+    importance_df = _compute_importance(X, y, INHAND_FEATURES)
+
+    # LR coefficients for interpretability
+    lr_pipe = _build_pipeline(
+        INHAND_FEATURES,
+        LogisticRegression(max_iter=1000, random_state=42, class_weight="balanced"),
+    )
+    lr_pipe.fit(X_tr, y_tr)
+    feat_names = lr_pipe.named_steps["preprocessor"].get_feature_names_out()
+    coefs      = lr_pipe.named_steps["model"].coef_[0]
+    coef_df    = pd.DataFrame({"feature": feat_names, "coef": coefs})
+    coef_df["feature"] = (
+        coef_df["feature"]
+        .str.replace(r"^num__", "", regex=True)
+        .str.replace(r"^cat__variant_", "variant=", regex=True)
+    )
+    _constant = {"number_of_players", "starting_stack", "variant=NT"}
+    coef_df = coef_df[~coef_df["feature"].isin(_constant)].copy()
+    coef_df = coef_df.reindex(
+        coef_df["coef"].abs().sort_values(ascending=False).index
+    ).reset_index(drop=True)
+
+    lr_auc = float(
+        metrics_df.loc[
+            metrics_df["modèle"].str.contains("Logistique"), "roc_auc"
+        ].iloc[0]
+    ) if len(metrics_df) else 0.0
+
+    return {
+        "metrics_df":  metrics_df,
+        "importance":  importance_df,
+        "coef_df":     coef_df,
+        "lr_auc":      lr_auc,
+        "n_train":     len(y_tr),
+        "n_test":      len(y_te),
+    }
+
+
+@st.cache_data(show_spinner=False)
+def compute_winrate_stats(df: pd.DataFrame) -> dict:
+    """Win rate by preflop score quintile and by hand category."""
+    d = df.copy()
+    d["_bucket"] = pd.qcut(
+        d["preflop_strength_score"], q=5,
+        labels=["Q1 (faibles)", "Q2", "Q3", "Q4", "Q5 (fortes)"],
+    )
+    by_bucket = (
+        d.groupby("_bucket", observed=False)["player_won"]
+        .agg(win_rate="mean", count="count")
+        .reset_index()
+        .rename(columns={"_bucket": "bucket"})
+    )
+    by_bucket["bucket"] = by_bucket["bucket"].astype(str)
+
+    cats = [
+        ("is_pair",   "Paire",    "Non-paire"),
+        ("is_suited", "Couleur",  "Offsuit"),
+        ("has_ace",   "Avec As",  "Sans As"),
+        ("has_king",  "Avec Roi", "Sans Roi"),
+    ]
+    rows = []
+    for col, yes_lbl, no_lbl in cats:
+        if col not in d.columns:
+            continue
+        for val, lbl in [(1, yes_lbl), (0, no_lbl)]:
+            sub = d[d[col] == val]
+            rows.append({
+                "col":      col,
+                "label":    lbl,
+                "yn":       "Oui" if val else "Non",
+                "win_rate": float(sub["player_won"].mean()),
+                "count":    len(sub),
+            })
+    return {
+        "by_bucket":   by_bucket,
+        "by_category": pd.DataFrame(rows),
+    }
 
 
 # ─── Street probability evolution ───────────────────────────────────────────

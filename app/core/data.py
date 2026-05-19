@@ -14,7 +14,6 @@ _REQUIRED_COLUMNS = [
     "player_won",
     "preflop_strength_score",
     "starting_stack",
-    "player_num_folds",
     "hand_id",
     "source_relative_path",
 ]

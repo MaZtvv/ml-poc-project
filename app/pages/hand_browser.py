@@ -2,7 +2,7 @@ import streamlit as st
 
 from core.data import load_player_features
 from core.model import build_hand_summary
-from core.ui import callout, page_header, section_label
+from core.ui import page_header, section_label
 
 # ─── Data ─────────────────────────────────────────────────────────────────────
 
@@ -67,7 +67,7 @@ st.divider()
 
 # ─── Hand list ────────────────────────────────────────────────────────────────
 
-section_label(f"{len(display_df)} mains — sélectionnez une ligne puis cliquez sur Analyser")
+section_label(f"{len(display_df)} mains disponibles — cliquez sur une ligne pour la sélectionner")
 
 display_df_ui = display_df.copy()
 display_df_ui["main"]    = display_df_ui["composite_id"].map(_short_label)
@@ -116,21 +116,45 @@ if selected_rows:
     correct      = display_df.iloc[row_idx]["correct"]
 
     st.divider()
-    info_col, btn_col = st.columns([3, 1])
 
-    with info_col:
-        correct_label = "✓ Prédiction correcte" if correct else "✗ Prédiction incorrecte"
-        callout(
-            f"<strong>{_short_label(composite_id)}</strong><br>"
-            f"Favori prédit : <strong>{favorite}</strong> ({prob:.1%})"
-            f" &nbsp;·&nbsp; Gagnant réel : <strong>{winner}</strong>"
-            f" &nbsp;·&nbsp; {correct_label}"
-        )
+    _cc   = "#22C55E" if correct else "#EF4444"
+    _ci   = "✓" if correct else "✗"
+    _clbl = "Correcte" if correct else "Incorrecte"
 
-    with btn_col:
-        st.markdown("")
-        if st.button("Analyser →", type="primary", use_container_width=True):
-            st.session_state["selected_composite_id"] = composite_id
-            st.switch_page("pages/hand_table.py")
+    st.markdown(
+        f'<div style="background:linear-gradient(135deg,#0C1826 0%,#09121E 100%);'
+        f'border:1px solid #1A2840;border-radius:12px;padding:1.1rem 1.5rem 1rem;'
+        f'margin-bottom:0.75rem;position:relative">'
+        f'<div style="position:absolute;top:0;left:0;right:0;height:2px;'
+        f'background:linear-gradient(90deg,#0C3050,rgba(56,189,248,0.12),transparent);'
+        f'border-radius:12px 12px 0 0"></div>'
+        f'<div style="font-size:0.68rem;color:#2D3F52;font-weight:800;letter-spacing:0.12em;'
+        f'text-transform:uppercase;margin-bottom:0.5rem">Main sélectionnée</div>'
+        f'<div style="font-size:0.95rem;font-weight:600;color:#C8D8E8;margin-bottom:0.8rem">'
+        f'{_short_label(composite_id)}</div>'
+        f'<div style="display:flex;gap:2.5rem;flex-wrap:wrap;align-items:flex-start">'
+        f'<div><div style="font-size:0.68rem;color:#2D3F52;margin-bottom:3px;font-weight:600;'
+        f'text-transform:uppercase;letter-spacing:0.08em">Favori prédit</div>'
+        f'<div style="font-weight:700;color:#38BDF8;font-size:0.9rem">'
+        f'{favorite} &nbsp;<span style="color:#1E3A52;font-weight:500">({prob:.1%})</span></div></div>'
+        f'<div><div style="font-size:0.68rem;color:#2D3F52;margin-bottom:3px;font-weight:600;'
+        f'text-transform:uppercase;letter-spacing:0.08em">Gagnant réel</div>'
+        f'<div style="font-weight:700;color:#E2E8F0;font-size:0.9rem">{winner}</div></div>'
+        f'<div><div style="font-size:0.68rem;color:#2D3F52;margin-bottom:3px;font-weight:600;'
+        f'text-transform:uppercase;letter-spacing:0.08em">Prédiction ML</div>'
+        f'<div style="font-weight:700;color:{_cc};font-size:0.9rem">{_ci} {_clbl}</div></div>'
+        f'</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    if st.button("▶  Analyser cette main", type="primary"):
+        st.session_state["selected_composite_id"] = composite_id
+        st.switch_page("pages/hand_table.py")
 else:
-    st.caption("Sélectionnez une ligne dans le tableau pour analyser la main.")
+    st.markdown(
+        '<p style="font-size:0.82rem;color:#2D3F52;margin-top:0.5rem">'
+        'Cliquez sur une ligne du tableau pour afficher le détail de la main.'
+        '</p>',
+        unsafe_allow_html=True,
+    )

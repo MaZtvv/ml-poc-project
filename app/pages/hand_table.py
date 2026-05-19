@@ -2,9 +2,16 @@ import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
 
+import pandas as pd
+
 from core.data import load_player_features, parse_hand_replay
 from core.hand_classifier import classify_made_hand, describe_preflop, detect_draws
-from core.model import build_hand_summary, compute_all_probabilities
+from core.model import (
+    INHAND_FEATURES,
+    build_hand_summary,
+    compute_all_probabilities,
+    get_inhand_lr_pipeline,
+)
 from core.table_renderer import render_poker_table
 from core.ui import callout, page_header, section_label
 
@@ -50,6 +57,90 @@ def _normalize(raw: dict, folded) -> dict:
         n = max(len(raw), 1)
         return {k: (1 / n if k not in folded else 0.0) for k in raw}
     return {k: (active.get(k, 0.0) / total) for k in raw}
+
+
+def _build_inhand_step_probs(
+    hand_df: pd.DataFrame,
+    replay_steps: list[dict],
+) -> list[dict]:
+    """
+    Compute in-hand model probabilities at every replay step.
+
+    Uses INHAND_FEATURES (no player_num_folds) with running counters:
+    - player_num_check_calls / player_num_bets_raises accumulate as actions happen
+    - num_board_deals increments at each new street (0→1→2→3)
+    - Folded players are explicitly zeroed, remaining players renormalised
+
+    Falls back to uniform distribution if the pipeline is unavailable.
+    """
+    _STREET_BOARD = {"preflop": 0, "flop": 1, "turn": 2, "river": 3, "showdown": 3}
+
+    try:
+        pipe = get_inhand_lr_pipeline()
+    except Exception:
+        n = len(hand_df)
+        return [{idx: 1.0 / n for idx in hand_df["player_position_index"]}
+                for _ in replay_steps]
+
+    player_indices = hand_df["player_position_index"].tolist()
+
+    # Preflop feature values — constant across all steps
+    _preflop_cols = [f for f in INHAND_FEATURES
+                     if f not in ("player_num_check_calls", "player_num_bets_raises",
+                                  "num_board_deals", "hand_action_count",
+                                  "num_check_calls", "num_bets_raises")]
+    preflop_base = [
+        {c: hand_df.iloc[i].get(c, 0) for c in _preflop_cols}
+        for i in range(len(player_indices))
+    ]
+
+    # Running action counters — updated before scoring each step
+    player_cc  = {idx: 0 for idx in player_indices}
+    player_cbr = {idx: 0 for idx in player_indices}
+    total_cc = total_cbr = total_actions = 0
+
+    result = []
+    for step in replay_steps:
+        # Update counters from this step's action
+        if step["type"] == "action":
+            p  = step.get("active")
+            at = step.get("action_type", "")
+            if p is not None:
+                total_actions += 1
+                if at == "call":
+                    player_cc[p]  = player_cc.get(p, 0) + 1
+                    total_cc += 1
+                elif at == "raise":
+                    player_cbr[p] = player_cbr.get(p, 0) + 1
+                    total_cbr += 1
+
+        board_count = _STREET_BOARD.get(step.get("street", "preflop"), 0)
+        folded      = step.get("folded", frozenset())
+
+        feat_rows = []
+        for i, idx in enumerate(player_indices):
+            feat = dict(preflop_base[i])
+            feat["player_num_check_calls"] = player_cc.get(idx, 0)
+            feat["player_num_bets_raises"] = player_cbr.get(idx, 0)
+            feat["num_board_deals"]        = board_count
+            feat["hand_action_count"]      = total_actions
+            feat["num_check_calls"]        = total_cc
+            feat["num_bets_raises"]        = total_cbr
+            feat_rows.append(feat)
+
+        X_step = pd.DataFrame(feat_rows, columns=INHAND_FEATURES)
+        raw    = pipe.predict_proba(X_step)[:, 1]
+
+        prob_dict = {idx: float(p) for idx, p in zip(player_indices, raw)}
+        for f_idx in folded:
+            prob_dict[f_idx] = 0.0
+        total = sum(prob_dict.values())
+        if total > 0:
+            prob_dict = {k: v / total for k, v in prob_dict.items()}
+
+        result.append(prob_dict)
+
+    return result
 
 
 def _card_text(rank: str, suit: str) -> str:
@@ -271,8 +362,12 @@ replay        = parse_hand_replay(source_path)
 replay_steps  = _build_replay_steps(replay, idx_to_name) if replay else []
 big_blind     = replay.get("big_blind") or 100 if replay else 100
 
-# ML probabilities: preflop LR score, renormalized at each step as players fold
-step_probs = [_normalize(initial_probs, step["folded"]) for step in replay_steps]
+# ML probabilities: in-hand model (no player_num_folds), updates at each action
+# and at each street transition (num_board_deals), zeroes folds by explicit logic.
+step_probs = (
+    _build_inhand_step_probs(hand_df, replay_steps)
+    if replay_steps else []
+)
 
 # Street jump points
 street_jumps: dict[str, int] = {}
@@ -379,15 +474,16 @@ with c_next:
 
 with c_banner:
     _atype  = cur_step.get("action_type") or ""
-    _acolor = _ACTION_COL.get(_atype, "#94AECF")
+    _acolor = _ACTION_COL.get(_atype, "#60A5FA")
     _st_fr  = _STREET_LABEL.get(cur_step.get("street", ""), "")
     _lbl    = cur_step.get("label", "")
     _num    = f"{step_idx + 1} / {total}" if total else "—"
     st.markdown(
-        f'<div style="background:#1A2236;border-radius:8px;padding:10px 18px;text-align:center">'
-        f'<div style="font-size:8.5px;color:#4A5568;font-weight:800;letter-spacing:0.12em;'
-        f'text-transform:uppercase;margin-bottom:3px">{_st_fr} · Étape {_num}</div>'
-        f'<div style="font-size:13px;font-weight:600;color:{_acolor}">{_lbl}</div>'
+        f'<div style="background:#0C1826;border:1px solid #1A2840;border-radius:10px;'
+        f'padding:11px 20px;text-align:center">'
+        f'<div style="font-size:7.5px;color:#2D3F52;font-weight:800;letter-spacing:0.14em;'
+        f'text-transform:uppercase;margin-bottom:4px">{_st_fr} &nbsp;·&nbsp; Step {_num}</div>'
+        f'<div style="font-size:13px;font-weight:600;color:{_acolor};letter-spacing:0.01em">{_lbl}</div>'
         f'</div>',
         unsafe_allow_html=True,
     )
@@ -416,39 +512,42 @@ _call_col   = "#D4A017" if panel_facing > 0 else "#3A4A5E"
 _raise_col  = "#E08030" if panel_raise  > 0 else "#3A4A5E"
 _street_lbl = _STREET_LABEL.get(cur_step.get("street", ""), "—")
 
+_sep = 'border-right:1px solid rgba(255,255,255,0.05);padding-right:20px;margin-right:20px'
+_lbl_css = 'font-size:7px;color:#2D3F52;font-weight:800;letter-spacing:0.13em;text-transform:uppercase;margin-bottom:5px'
+_val_css = 'font-size:13.5px;font-weight:700;white-space:nowrap;letter-spacing:-0.01em'
+
 st.markdown(
-    f'<div style="background:#0C1520;border:1px solid rgba(255,255,255,0.08);'
-    f'border-radius:10px;padding:11px 20px;margin:8px 0 10px;'
-    f'display:grid;grid-template-columns:repeat(5,1fr);gap:0">'
+    f'<div style="background:linear-gradient(135deg,#0C1826 0%,#09121E 100%);'
+    f'border:1px solid #1A2840;border-radius:12px;padding:13px 24px;margin:8px 0 12px;'
+    f'display:grid;grid-template-columns:repeat(5,1fr);gap:0;position:relative">'
 
-    f'<div style="border-right:1px solid rgba(255,255,255,0.07);padding-right:16px;margin-right:16px">'
-    f'<div style="font-size:7.5px;color:#4A5568;font-weight:800;letter-spacing:0.11em;'
-    f'text-transform:uppercase;margin-bottom:4px">Pot</div>'
-    f'<div style="font-size:13px;font-weight:700;color:#D1D9E6;white-space:nowrap">{_pot_disp}</div>'
+    f'<div style="position:absolute;top:0;left:0;right:0;height:2px;'
+    f'background:linear-gradient(90deg,#0C3050,rgba(56,189,248,0.15),transparent);'
+    f'border-radius:12px 12px 0 0"></div>'
+
+    f'<div style="{_sep}">'
+    f'<div style="{_lbl_css}">Pot</div>'
+    f'<div style="{_val_css};color:#E2E8F0">{_pot_disp}</div>'
     f'</div>'
 
-    f'<div style="border-right:1px solid rgba(255,255,255,0.07);padding-right:16px;margin-right:16px">'
-    f'<div style="font-size:7.5px;color:#4A5568;font-weight:800;letter-spacing:0.11em;'
-    f'text-transform:uppercase;margin-bottom:4px">Mise actuelle</div>'
-    f'<div style="font-size:13px;font-weight:700;color:{_call_col};white-space:nowrap">{_call_disp}</div>'
+    f'<div style="{_sep}">'
+    f'<div style="{_lbl_css}">Mise actuelle</div>'
+    f'<div style="{_val_css};color:{_call_col}">{_call_disp}</div>'
     f'</div>'
 
-    f'<div style="border-right:1px solid rgba(255,255,255,0.07);padding-right:16px;margin-right:16px">'
-    f'<div style="font-size:7.5px;color:#4A5568;font-weight:800;letter-spacing:0.11em;'
-    f'text-transform:uppercase;margin-bottom:4px">Dernière relance</div>'
-    f'<div style="font-size:13px;font-weight:700;color:{_raise_col};white-space:nowrap">{_raise_disp}</div>'
+    f'<div style="{_sep}">'
+    f'<div style="{_lbl_css}">Dernière relance</div>'
+    f'<div style="{_val_css};color:{_raise_col}">{_raise_disp}</div>'
     f'</div>'
 
-    f'<div style="border-right:1px solid rgba(255,255,255,0.07);padding-right:16px;margin-right:16px">'
-    f'<div style="font-size:7.5px;color:#4A5568;font-weight:800;letter-spacing:0.11em;'
-    f'text-transform:uppercase;margin-bottom:4px">Joueurs actifs</div>'
-    f'<div style="font-size:13px;font-weight:700;color:#94AECF">{panel_active}</div>'
+    f'<div style="{_sep}">'
+    f'<div style="{_lbl_css}">Joueurs actifs</div>'
+    f'<div style="{_val_css};color:#60A5FA">{panel_active}</div>'
     f'</div>'
 
     f'<div>'
-    f'<div style="font-size:7.5px;color:#4A5568;font-weight:800;letter-spacing:0.11em;'
-    f'text-transform:uppercase;margin-bottom:4px">Street</div>'
-    f'<div style="font-size:13px;font-weight:700;color:#6B7E96">{_street_lbl}</div>'
+    f'<div style="{_lbl_css}">Street</div>'
+    f'<div style="{_val_css};color:#4B5E72">{_street_lbl}</div>'
     f'</div>'
 
     f'</div>',
@@ -484,7 +583,8 @@ for _, _row in hand_df.iterrows():
         "name":             name,
         "stack":            live_stack,
         "hole_cards":       str(_row.get("hole_cards") or ""),
-        "probability":      cur_equity.get(p_idx, 0.0),   # equity in the seat bar
+        "probability":      cur_equity.get(p_idx, 0.0),
+        "position":         _POS_LABEL.get(p_idx, f"p{p_idx}"),
         "is_winner":        is_win and is_showdown,
         "is_favorite":      (p_idx == dyn_fav_idx) and not is_showdown,
         "folded":           p_idx in folded_now,
@@ -500,9 +600,13 @@ table_html = render_poker_table(
     board_cards=board_now if board_now else None,
 )
 components.html(table_html, height=590, scrolling=False)
-st.caption(
-    "Seat bars (%) = true poker equity (Monte Carlo preflop / exact turn-river). "
-    "Green border = equity leader at the current street."
+st.markdown(
+    '<p style="font-size:0.75rem;color:#2D3F52;margin:-4px 0 0;padding-left:2px">'
+    'Barres de sièges (%) = équité vraie (Monte Carlo préflop / exact turn-river). '
+    'Badge <span style="color:#22C55E">●</span> vert = leader en équité à ce stade. '
+    'Badge <span style="color:#F59E0B">●</span> or = vainqueur au showdown.'
+    '</p>',
+    unsafe_allow_html=True,
 )
 
 # ─── Hand analysis expander ───────────────────────────────────────────────────
@@ -575,7 +679,7 @@ st.divider()
 col_chart, col_log = st.columns([6, 4])
 
 with col_chart:
-    section_label("Prédiction ML vs Équité poker")
+    section_label("Modèle In-Hand vs Équité poker")
 
     fig = go.Figure()
 
@@ -585,7 +689,7 @@ with col_chart:
         is_win = bool(_row["player_won"] == 1)
         color  = "#F4B942" if is_win else _PLR_COLORS[p_idx % len(_PLR_COLORS)]
 
-        # ML prediction (solid) — renormalized preflop LR score
+        # In-hand ML prediction (solid) — updates at every action + street change
         y_ml = [sp.get(p_idx, 0.0) * 100 for sp in step_probs]
         fig.add_trace(go.Scatter(
             x=list(range(len(y_ml))),
@@ -593,10 +697,10 @@ with col_chart:
             mode="lines",
             name=name,
             line=dict(color=color, width=2.5 if is_win else 1.5, shape="hv"),
-            hovertemplate=f"{name} ML: %{{y:.1f}}%<extra></extra>",
+            hovertemplate=f"{name} in-hand: %{{y:.1f}}%<extra></extra>",
         ))
 
-        # Equity (dashed) — true hand equity, steps only at street changes
+        # Equity (dashed) — true hand equity, updates only at street changes
         y_eq = [eq.get(p_idx, 0.0) * 100 for eq in equity_at_step]
         fig.add_trace(go.Scatter(
             x=list(range(len(y_eq))),
@@ -634,21 +738,25 @@ with col_chart:
     )
     st.plotly_chart(fig, use_container_width=True)
     st.caption(
-        "Solid = ML prediction (preflop LR score, renormalized on folds). "
-        "Dotted = true poker equity (updates only on new street). "
-        "These two curves measure different things."
+        "Trait plein = modèle in-hand (LR sans player_num_folds, mis à jour à chaque action et à chaque street). "
+        "Pointillés = équité vraie (Monte Carlo / exact). "
+        "Les deux courbes mesurent des choses différentes."
     )
 
 with col_log:
     section_label("Journal de la main")
 
-    log_html = '<div style="font-size:11px;line-height:1.65;max-height:340px;overflow-y:auto">'
+    log_html = (
+        '<div style="font-size:11px;line-height:1.65;max-height:350px;overflow-y:auto;'
+        'padding-right:4px">'
+    )
 
     if replay_steps:
         log_html += (
-            '<div style="margin-bottom:5px">'
-            '<span style="font-size:8.5px;font-weight:800;letter-spacing:0.12em;'
-            'color:#4A5568;text-transform:uppercase">PREFLOP</span>'
+            '<div style="margin-bottom:6px">'
+            '<span style="font-size:7.5px;font-weight:800;letter-spacing:0.14em;'
+            'color:#1E3047;text-transform:uppercase;border-left:2px solid #1A3047;'
+            'padding-left:6px">PREFLOP</span>'
             '</div>'
         )
 
@@ -663,11 +771,12 @@ with col_log:
             _cards_html = " ".join(_card_text(r, s) for r, s in _step.get("new_cards", []))
             _st_fr_lbl  = _street.upper()
             log_html += (
-                f'<div style="margin-top:12px;margin-bottom:5px;display:flex;'
-                f'align-items:baseline;gap:6px;flex-wrap:wrap">'
-                f'<span style="font-size:8.5px;font-weight:800;letter-spacing:0.12em;'
-                f'color:#4A5568;text-transform:uppercase">{_st_fr_lbl}</span>'
-                f'<span style="font-size:13px">{_cards_html}</span>'
+                f'<div style="margin-top:14px;margin-bottom:6px;display:flex;'
+                f'align-items:center;gap:7px;flex-wrap:wrap">'
+                f'<span style="font-size:7.5px;font-weight:800;letter-spacing:0.14em;'
+                f'color:#1E3047;text-transform:uppercase;border-left:2px solid #1A3047;'
+                f'padding-left:6px">{_st_fr_lbl}</span>'
+                f'<span style="font-size:14px">{_cards_html}</span>'
                 f'</div>'
             )
             _sa_br  = _step.get("state_after", {})
@@ -675,19 +784,21 @@ with col_log:
             _bb_br  = _sa_br.get("big_blind") or big_blind
             if _pot_br > 0:
                 log_html += (
-                    f'<div style="font-size:9px;color:#3A4A5E;margin-bottom:4px;'
-                    f'padding-left:2px">Pot:&nbsp;'
-                    f'<strong style="color:#4A5A6E">{_fmtc(_pot_br)}'
-                    f'&nbsp;({_pot_br / _bb_br:.1f}&nbsp;BB)</strong></div>'
+                    f'<div style="font-size:8.5px;color:#1E2D3E;margin-bottom:5px;'
+                    f'padding-left:8px">Pot: '
+                    f'<strong style="color:#2D4056">{_fmtc(_pot_br)}'
+                    f'&nbsp;({_pot_br / _bb_br:.1f} BB)</strong></div>'
                 )
             continue
 
         if _stype == "showdown":
             log_html += (
-                f'<div style="margin-top:10px;padding:6px 8px;'
-                f'background:rgba(244,185,66,0.1);border-radius:5px;'
-                f'border-left:3px solid #F4B942">'
-                f'<span style="color:#F4B942;font-weight:700">★ {winner_name}</span>'
+                f'<div style="margin-top:12px;padding:7px 10px;'
+                f'background:rgba(245,158,11,0.08);border-radius:7px;'
+                f'border-left:3px solid rgba(245,158,11,0.45)">'
+                f'<span style="font-size:7.5px;color:#6B4500;font-weight:800;'
+                f'letter-spacing:0.12em;text-transform:uppercase;display:block;margin-bottom:2px">Showdown</span>'
+                f'<span style="color:#F59E0B;font-weight:700;font-size:12px">★ {winner_name}</span>'
                 f'</div>'
             )
             continue
@@ -714,20 +825,26 @@ with col_log:
             _verb = "Fold"
 
         _acolor = _ACTION_COL.get(_atype, "#6B7280")
-        _pc     = _POS_COLOR.get(_pos, "#4A5568")
         _is_cur = (_li == step_idx)
-        _bg     = "background:rgba(220,225,255,0.09);border-radius:3px;" if _is_cur else ""
-        _fw     = "font-weight:700;" if _is_cur else ""
+        _bg     = "background:rgba(56,189,248,0.07);border-radius:5px;" if _is_cur else ""
+        _fw     = "font-weight:700;" if _is_cur else "font-weight:500;"
+
+        if _pos == "BTN":
+            _pbg, _pcol, _pbr = "#1C1000", "#F59E0B", "10px"
+        elif _pos in ("SB", "BB"):
+            _pbg, _pcol, _pbr = "#091C35", "#60A5FA", "4px"
+        else:
+            _pbg, _pcol, _pbr = "#111B28", "#3D5166", "4px"
 
         log_html += (
             f'<div style="display:flex;align-items:center;gap:6px;'
-            f'margin-bottom:3px;padding:2px 4px;{_bg}">'
-            f'<span style="background:{_pc};color:#FFF;font-size:7.5px;font-weight:700;'
-            f'padding:1px 4px;border-radius:3px;min-width:26px;text-align:center;'
-            f'flex-shrink:0">{_pos}</span>'
+            f'margin-bottom:2px;padding:3px 5px;{_bg}">'
+            f'<span style="background:{_pbg};color:{_pcol};font-size:7px;font-weight:800;'
+            f'padding:1.5px 5px;border-radius:{_pbr};min-width:26px;text-align:center;'
+            f'flex-shrink:0;letter-spacing:0.07em">{_pos}</span>'
             f'<span style="color:#94AECF;{_fw}flex:1;white-space:nowrap;overflow:hidden;'
-            f'text-overflow:ellipsis">{_name}</span>'
-            f'<span style="color:{_acolor};{_fw}white-space:nowrap">{_verb}</span>'
+            f'text-overflow:ellipsis;font-size:11px">{_name}</span>'
+            f'<span style="color:{_acolor};{_fw}white-space:nowrap;font-size:11px">{_verb}</span>'
             f'</div>'
         )
 
@@ -739,18 +856,21 @@ with col_log:
 st.divider()
 section_label("Note méthodologique")
 callout(
-    "<strong>Two distinct probability layers:</strong><br>"
-    "<strong>ML prediction (solid lines)</strong> — Logistic Regression preflop score "
-    "(<code>class_weight='balanced'</code>), trained on starting features. "
-    "Updates only by renormalization when a player folds. Does not see community cards.<br>"
-    "<strong>Poker equity (dashed lines / seat bars)</strong> — true probability that a hand wins "
-    "against the other visible hands, computed over the remaining deck. "
-    "Exact enumeration at turn/river; Monte Carlo (1,200 samples, fixed seed) at preflop/flop. "
-    "Updates only when a new street is dealt.<br>"
-    "<em>These two metrics measure different things. "
-    "ML reflects learned statistical patterns; equity reflects actual card strength.</em><br><br>"
-    "<strong>Dataset scope:</strong> the Pluribus dataset (10,000 hands) is an AI research benchmark, "
-    "<em>not</em> tournament data. Every hand resets to 10,000 chip stacks with fixed 50/100 blinds — "
-    "there is no elimination, no blind escalation, no session continuity. "
-    "The ML model predicts <em>who wins a given hand</em>, not a tournament winner."
+    "<strong>Deux couches de probabilité distinctes :</strong><br>"
+    "<strong>Modèle in-hand (trait plein)</strong> — Régression Logistique entraînée sur les variables "
+    "préflop + style d'action (<code>player_num_check_calls</code>, <code>player_num_bets_raises</code>, "
+    "<code>num_board_deals</code>…). "
+    "<strong>Sans <code>player_num_folds</code></strong> — la tautologie de fuite principale est supprimée. "
+    "La probabilité est recalculée à chaque action (les compteurs d'actions s'accumulent) "
+    "et à chaque nouvelle street (<code>num_board_deals</code> passe de 0 à 3). "
+    "Les joueurs couchés sont exclus par logique de jeu explicite, pas par variable de fuite.<br>"
+    "<em>Limitation résiduelle :</em> <code>player_num_check_calls</code> et <code>player_num_bets_raises</code> "
+    "restent des résumés de la main entière — le modèle est une approximation, pas une prédiction strictement chronologique.<br><br>"
+    "<strong>Équité vraie (pointillés / barres de sièges)</strong> — probabilité réelle de gagner "
+    "contre les autres mains visibles. Énumération exacte au turn/river ; Monte Carlo "
+    "(1 200 tirages, graine fixe) au préflop/flop. Ne change qu'à chaque nouvelle street.<br><br>"
+    "<strong>Périmètre du dataset :</strong> Pluribus (10 000 mains) est un benchmark de recherche IA, "
+    "<em>pas</em> des données de tournoi. Chaque main repart avec 10 000 jetons et les blindes 50/100 — "
+    "pas d'élimination, pas d'escalade des blindes. "
+    "Le modèle prédit <em>qui gagne une main donnée</em>, pas un vainqueur de tournoi."
 )

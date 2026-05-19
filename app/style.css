@@ -8,33 +8,33 @@ html, body, [class*="css"] {
 
 /* ─── Page container ──────────────────────────────────────── */
 .block-container {
-    padding-top: 2rem !important;
+    padding-top: 1.75rem !important;
     padding-bottom: 4rem !important;
-    max-width: 1260px;
+    max-width: 1300px;
 }
 
 /* ─── Metric cards ────────────────────────────────────────── */
 [data-testid="metric-container"] {
-    background: #1A2236;
-    border: 1px solid rgba(255,255,255,0.07);
-    border-radius: 10px;
-    padding: 1rem 1.25rem;
-    box-shadow: 0 2px 12px rgba(0,0,0,0.3);
+    background: #0D1420;
+    border: 1px solid #1A2840;
+    border-radius: 12px;
+    padding: 1.1rem 1.4rem;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.03);
 }
 
 [data-testid="stMetricLabel"] > div {
-    font-size: 0.7rem !important;
-    font-weight: 600 !important;
+    font-size: 0.67rem !important;
+    font-weight: 700 !important;
     text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: #64748B !important;
+    letter-spacing: 0.11em;
+    color: #3D4F62 !important;
 }
 
 [data-testid="stMetricValue"] {
     font-size: 1.7rem !important;
     font-weight: 700 !important;
-    color: #D1D9E6 !important;
-    letter-spacing: -0.02em;
+    color: #E2E8F0 !important;
+    letter-spacing: -0.025em;
 }
 
 /* ─── Section label ───────────────────────────────────────── */
@@ -42,73 +42,119 @@ html, body, [class*="css"] {
     font-size: 0.67rem;
     font-weight: 700;
     text-transform: uppercase;
-    letter-spacing: 0.1em;
-    color: #4A5568;
-    margin: 0 0 0.5rem 0;
-    padding: 0;
+    letter-spacing: 0.12em;
+    color: #2D3F52;
+    border-left: 2px solid #1A3047;
+    padding: 0 0 0 0.55rem;
+    margin: 0 0 0.7rem 0;
+    line-height: 1.4;
+    display: block;
 }
 
 /* ─── Callout boxes ───────────────────────────────────────── */
 .callout-info {
-    background: rgba(75, 111, 165, 0.12);
-    border-left: 3px solid #4A6FA5;
+    background: rgba(56, 189, 248, 0.06);
+    border-left: 3px solid rgba(56, 189, 248, 0.4);
     border-radius: 0 8px 8px 0;
-    padding: 0.8rem 1.1rem;
+    padding: 0.85rem 1.25rem;
     margin: 0.5rem 0 1rem 0;
-    font-size: 0.85rem;
-    color: #94AECF;
-    line-height: 1.65;
+    font-size: 0.84rem;
+    color: #7EC8F4;
+    line-height: 1.75;
 }
 
 .callout-warning {
-    background: rgba(212, 160, 23, 0.1);
-    border-left: 3px solid #D4A017;
+    background: rgba(245, 158, 11, 0.07);
+    border-left: 3px solid rgba(245, 158, 11, 0.45);
     border-radius: 0 8px 8px 0;
-    padding: 0.8rem 1.1rem;
+    padding: 0.85rem 1.25rem;
     margin: 0.5rem 0 1rem 0;
-    font-size: 0.85rem;
-    color: #BF8C0A;
-    line-height: 1.65;
+    font-size: 0.84rem;
+    color: #F4C85A;
+    line-height: 1.75;
 }
 
 /* ─── Sidebar ─────────────────────────────────────────────── */
 [data-testid="stSidebar"] {
-    border-right: 1px solid rgba(255,255,255,0.05);
+    border-right: 1px solid rgba(255,255,255,0.04);
 }
 
 [data-testid="stSidebar"] .block-container {
-    padding-top: 1.5rem !important;
+    padding-top: 1.25rem !important;
+    padding-bottom: 2rem !important;
 }
 
 /* ─── Nav links ───────────────────────────────────────────── */
 [data-testid="stSidebarNavLink"] {
-    border-radius: 7px !important;
+    border-radius: 8px !important;
     font-size: 0.875rem !important;
     font-weight: 500 !important;
-    padding: 0.45rem 0.8rem !important;
+    padding: 0.5rem 0.9rem !important;
     margin-bottom: 2px !important;
+}
+
+[data-testid="stSidebarNavLink"][aria-selected="true"] {
+    background: rgba(56, 189, 248, 0.1) !important;
 }
 
 /* ─── Tabs ────────────────────────────────────────────────── */
 [data-testid="stTabs"] button[role="tab"] {
     font-size: 0.875rem;
     font-weight: 500;
-    padding: 0.5rem 1.1rem;
+    padding: 0.55rem 1.2rem;
 }
 
 /* ─── DataFrames ──────────────────────────────────────────── */
 [data-testid="stDataFrame"] {
-    border: 1px solid rgba(255,255,255,0.07) !important;
-    border-radius: 8px !important;
+    border: 1px solid #1A2840 !important;
+    border-radius: 10px !important;
     overflow: hidden;
+}
+
+/* ─── Plotly charts — prevent white box ──────────────────── */
+.stPlotlyChart > div {
+    background: transparent !important;
+}
+
+/* ─── Expander ────────────────────────────────────────────── */
+[data-testid="stExpander"] {
+    border: 1px solid #1A2840 !important;
+    border-radius: 10px !important;
+}
+
+/* ─── Primary button ──────────────────────────────────────── */
+[data-testid="baseButton-primary"] {
+    background: linear-gradient(135deg, #0C4A6E, #0369A1) !important;
+    border: 1px solid #0284C7 !important;
+    box-shadow: 0 2px 8px rgba(3,105,161,0.3) !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.01em !important;
+}
+
+/* ─── Secondary button ────────────────────────────────────── */
+[data-testid="baseButton-secondary"] {
+    border: 1px solid #1A2840 !important;
+    font-weight: 500 !important;
+}
+
+/* ─── Selectbox / input ───────────────────────────────────── */
+[data-testid="stSelectbox"] > div > div {
+    border-color: #1A2840 !important;
+    border-radius: 8px !important;
 }
 
 /* ─── Divider ─────────────────────────────────────────────── */
 hr {
     border: none !important;
-    border-top: 1px solid rgba(255,255,255,0.06) !important;
+    border-top: 1px solid rgba(255,255,255,0.05) !important;
     margin: 1.75rem 0 !important;
 }
+
+/* ─── Scrollbar ───────────────────────────────────────────── */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: rgba(255,255,255,0.02); }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.10); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.20); }
 
 /* ─── Hide Streamlit chrome ───────────────────────────────── */
 #MainMenu { visibility: hidden; }
